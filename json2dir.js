@@ -282,22 +282,26 @@ function writeFile(path, content, where) {
   t.Close();
 }
 
+// Wine's FileSystemObject cannot tell a symbolic link from its target: FileExists/FolderExists
+// follow links, DeleteFile/DeleteFolder on a link remove the TARGET (possibly outside the target
+// directory), and merging into an existing folder may write through a link. So any entry that
+// already exists is refused, nothing is ever deleted, and nothing is created in an existing folder.
+function refuseExisting(path, where) {
+  if (fso.FolderExists(path) || fso.FileExists(path))
+    fail("existing entry " + where + ": cannot tell whether it is a symbolic link under Wine, refusing to touch it");
+}
+
 function apply(dir, rel, tree) {
   var names = tree.names.slice(0).sort(compareUtf8);
   for (var i = 0; i < names.length; i++) {
     var name = names[i], value = tree.values["$" + name];
     var path = dir + "\\" + name, where = rel == "" ? name : rel + "/" + name;
     try {
-      var isDir = fso.FolderExists(path), isFile = fso.FileExists(path);
+      refuseExisting(path, where);
       if (typeof value == "string") {
-        if (isDir) fail(where + ": a directory is in the way");
-        if (isFile) fso.DeleteFile(path, true);
-        writeFile(path, value, where);
+        writeFile(path, value, where); // CreateTextFile without overwrite
       } else {
-        if (!isDir) {
-          if (isFile) fso.DeleteFile(path, true);
-          fso.CreateFolder(path);
-        }
+        fso.CreateFolder(path); // fails if the name exists
         apply(path, where, value);
       }
     } catch (e) {
@@ -317,7 +321,14 @@ function main() {
     if (!isObject(doc)) fail("the root of the document must be an object");
     validate(doc, ".");
     // "\\?\" turns off Win32 path rewriting, so names like "a." or "con" are used as given.
-    apply("\\\\?\\" + fso.GetAbsolutePathName("."), "", doc);
+    var root = "\\\\?\\" + fso.GetAbsolutePathName(".");
+    // Pre-pass: a clash at the top level fails before anything is written. Deeper names live in
+    // directories this run creates, which start empty; apply() checks every entry again anyway.
+    for (var i = 0; i < doc.names.length; i++) {
+      try { refuseExisting(root + "\\" + doc.names[i], doc.names[i]); }
+      catch (e) { if (e instanceof Fail) throw e; fail(doc.names[i] + ": " + (e.message || "file system error")); }
+    }
+    apply(root, "", doc);
     return 0;
   } catch (e) {
     writeStderr("json2dir: " + (e instanceof Fail ? e.message : (e.message || "error") + " (0x" + (e.number >>> 0).toString(16) + ")") + "\n");
